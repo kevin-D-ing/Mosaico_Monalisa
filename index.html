@@ -1,0 +1,171 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<title>Para a Vitória</title>
+<style>
+  :root { --bg:#0e0b12; --fg:#f4eef8; --accent:#ff6f91; }
+  * { box-sizing:border-box; }
+  html,body { margin:0; height:100%; background:var(--bg); color:var(--fg);
+    font-family: Georgia, 'Times New Roman', serif; overflow:hidden; }
+  #stage { position:absolute; inset:0; touch-action:none; cursor:grab; overflow:hidden; }
+  #stage.drag { cursor:grabbing; }
+  #world { position:absolute; left:0; top:0; transform-origin:0 0; will-change:transform; }
+  canvas { display:block; box-shadow:0 20px 80px rgba(0,0,0,.6); image-rendering:auto; }
+  header { position:absolute; top:0; left:0; right:0; padding:16px; text-align:center; pointer-events:none;
+    background:linear-gradient(var(--bg), transparent); z-index:5; }
+  header h1 { margin:0; font-size:clamp(1.1rem,3.5vw,1.8rem); font-weight:normal; letter-spacing:.04em; }
+  header p { margin:4px 0 0; font-size:.85rem; opacity:.7; font-style:italic; transition:opacity 1.2s; }
+  .ctrl { position:absolute; right:16px; bottom:16px; display:flex; flex-direction:column; gap:8px; z-index:5; }
+  button { font:inherit; color:var(--fg); background:rgba(255,255,255,.1); border:1px solid rgba(255,255,255,.2);
+    border-radius:999px; min-width:44px; height:44px; font-size:1.2rem; cursor:pointer; backdrop-filter:blur(6px); }
+  button:hover { background:rgba(255,255,255,.2); }
+  #letter { position:absolute; left:16px; bottom:16px; z-index:5; padding:0 18px; font-size:.95rem; }
+  #modal { position:fixed; inset:0; background:rgba(8,6,12,.88); display:none; align-items:center; justify-content:center;
+    z-index:10; padding:16px; }
+  #modal.open { display:flex; }
+  .card { max-width:min(560px,100%); max-height:100%; overflow:auto; text-align:center; }
+  .card img { max-width:100%; max-height:62vh; border-radius:10px; box-shadow:0 10px 50px rgba(0,0,0,.6); }
+  .card p { font-size:1.15rem; line-height:1.55; margin:18px 8px 6px; white-space:pre-line; }
+  .card.final p { font-size:1.02rem; text-align:left; margin:16px 4px 6px; }
+  .card.final img { max-height:34vh; }
+  .card small { opacity:.5; display:block; margin-top:10px; }
+  #loading { position:absolute; inset:0; display:flex; align-items:center; justify-content:center; z-index:20;
+    background:var(--bg); font-style:italic; transition:opacity .8s; }
+</style>
+</head>
+<body>
+<div id="loading">Preparando uma coisa pra você…</div>
+<header><h1 id="title"></h1><p id="hint"></p></header>
+<div id="stage"><div id="world"><canvas id="mosaic"></canvas></div></div>
+<button id="letter" style="display:none">💌 Abrir mensagem</button>
+<div class="ctrl"><button id="zin" aria-label="Aproximar">+</button><button id="zout" aria-label="Afastar">−</button></div>
+<div id="modal"><div class="card"><img id="mimg" alt=""><p id="mtext"></p><small>toque para fechar</small></div></div>
+
+<script>
+(async () => {
+  const CELL = 36;
+  const $ = id => document.getElementById(id);
+  const cfg = await (await fetch('memories.json', {cache:'no-store'})).json();
+  $('title').textContent = cfg.title || '';
+  $('hint').textContent = cfg.hint || 'chegue perto e toque em qualquer quadradinho';
+  document.title = cfg.title || 'Para você';
+
+  const load = src => new Promise(res => { const i = new Image(); i.onload = () => res(i); i.onerror = () => res(null); i.src = src; });
+  const main = await load(cfg.main);
+  if (!main) { $('loading').textContent = 'Não encontro a foto principal: ' + cfg.main; return; }
+  const loaded = await Promise.all(cfg.tiles.map(async t => ({...t, img: await load(t.file)})));
+  const tiles = loaded.filter(t => t.img);
+  if (!tiles.length) { $('loading').textContent = 'Não encontrei nenhuma foto das lembranças.'; return; }
+
+  // average color of each tile
+  const tmp = document.createElement('canvas'); tmp.width = tmp.height = 4;
+  const tctx = tmp.getContext('2d', {willReadFrequently:true});
+  for (const t of tiles) {
+    tctx.drawImage(t.img, 0, 0, 4, 4);
+    const d = tctx.getImageData(0,0,4,4).data; let r=0,g=0,b=0;
+    for (let i=0;i<d.length;i+=4){ r+=d[i]; g+=d[i+1]; b+=d[i+2]; }
+    const n = d.length/4; t.rgb = [r/n,g/n,b/n];
+  }
+
+  // sample main photo into a cols x rows grid
+  const cols = cfg.cols || 56;
+  const rows = Math.round(cols * main.height / main.width);
+  const sm = document.createElement('canvas'); sm.width = cols; sm.height = rows;
+  const sctx = sm.getContext('2d', {willReadFrequently:true});
+  sctx.imageSmoothingQuality = 'high'; sctx.drawImage(main, 0, 0, cols, rows);
+  const px = sctx.getImageData(0,0,cols,rows).data;
+
+  // assign a tile to every cell (color match + penalty for overuse + no equal neighbours)
+  const uses = new Array(tiles.length).fill(0);
+  const grid = new Array(cols*rows);
+  const penalty = cfg.repeatPenalty ?? 5;
+  for (let y=0;y<rows;y++) for (let x=0;x<cols;x++) {
+    const k = y*cols+x, r=px[k*4], g=px[k*4+1], b=px[k*4+2];
+    let best=-1, bc=Infinity;
+    for (let i=0;i<tiles.length;i++) {
+      if ((x>0 && grid[k-1]===i) || (y>0 && grid[k-cols]===i)) continue;
+      const t=tiles[i].rgb;
+      const c = Math.hypot(r-t[0],g-t[1],b-t[2]) + uses[i]*penalty + Math.random()*8;
+      if (c<bc){bc=c;best=i;}
+    }
+    if (best<0) best = Math.floor(Math.random()*tiles.length);
+    grid[k]=best; uses[best]++;
+  }
+
+  // draw
+  const cv = $('mosaic'); cv.width = cols*CELL; cv.height = rows*CELL;
+  const ctx = cv.getContext('2d');
+  const tint = cfg.tint ?? 0.5;
+  const flat = k => { ctx.fillStyle = `rgb(${px[k*4]},${px[k*4+1]},${px[k*4+2]})`;
+    ctx.fillRect((k%cols)*CELL, Math.floor(k/cols)*CELL, CELL, CELL); };
+  const photo = k => {
+    const x=(k%cols)*CELL, y=Math.floor(k/cols)*CELL, im=tiles[grid[k]].img;
+    const s=Math.min(im.width,im.height), sx=(im.width-s)/2, sy=(im.height-s)/2;
+    ctx.globalAlpha=1; ctx.drawImage(im,sx,sy,s,s,x,y,CELL,CELL);
+    ctx.globalAlpha=tint; ctx.fillStyle=`rgb(${px[k*4]},${px[k*4+1]},${px[k*4+2]})`; ctx.fillRect(x,y,CELL,CELL);
+    ctx.globalAlpha=1;
+  };
+  for (let k=0;k<cols*rows;k++) flat(k);
+
+  // view / zoom / pan
+  const stage=$('stage'), world=$('world');
+  let scale=1, tx=0, ty=0, fit=1;
+  const apply = () => world.style.transform = `translate(${tx}px,${ty}px) scale(${scale})`;
+  const clamp = () => {
+    const TOP=64, w=cv.width*scale, h=cv.height*scale, W=stage.clientWidth, H=stage.clientHeight-TOP;
+    tx = w<=W ? (W-w)/2 : Math.min(0, Math.max(W-w, tx));
+    ty = h<=H ? TOP+(H-h)/2 : Math.min(TOP, Math.max(TOP+H-h, ty));
+  };
+  const zoomAt = (f, cx, cy) => {
+    const ns = Math.min(5, Math.max(fit, scale*f)); f = ns/scale;
+    tx = cx-(cx-tx)*f; ty = cy-(cy-ty)*f; scale = ns; clamp(); apply();
+  };
+  const refit = () => { const old=fit; fit=Math.min(stage.clientWidth/cv.width, (stage.clientHeight-64-10)/cv.height);
+    if (scale<=old*1.001 || scale<fit) scale=fit; clamp(); apply(); };
+  scale = 0; refit(); addEventListener('resize', refit);
+
+  stage.addEventListener('wheel', e => { e.preventDefault(); zoomAt(e.deltaY<0?1.25:0.8, e.clientX, e.clientY); }, {passive:false});
+  $('zin').onclick = () => zoomAt(1.6, stage.clientWidth/2, stage.clientHeight/2);
+  $('zout').onclick = () => zoomAt(1/1.6, stage.clientWidth/2, stage.clientHeight/2);
+
+  const ptrs = new Map(); let moved=0, pinch=0;
+  stage.addEventListener('pointerdown', e => { stage.setPointerCapture(e.pointerId); ptrs.set(e.pointerId,{x:e.clientX,y:e.clientY}); moved=0; stage.classList.add('drag');
+    if (ptrs.size===2) { const [a,b]=[...ptrs.values()]; pinch=Math.hypot(a.x-b.x,a.y-b.y); } });
+  stage.addEventListener('pointermove', e => {
+    const p=ptrs.get(e.pointerId); if(!p) return;
+    if (ptrs.size===2) {
+      p.x=e.clientX; p.y=e.clientY; const [a,b]=[...ptrs.values()]; const d=Math.hypot(a.x-b.x,a.y-b.y);
+      if (pinch) zoomAt(d/pinch,(a.x+b.x)/2,(a.y+b.y)/2); pinch=d; moved=99; return;
+    }
+    moved += Math.abs(e.clientX-p.x)+Math.abs(e.clientY-p.y);
+    tx += e.clientX-p.x; ty += e.clientY-p.y; p.x=e.clientX; p.y=e.clientY; clamp(); apply();
+  });
+  const up = e => { ptrs.delete(e.pointerId); pinch=0; stage.classList.remove('drag');
+    if (e.type==='pointerup' && moved<6 && ptrs.size===0) openAt(e.clientX,e.clientY); };
+  stage.addEventListener('pointerup', up); stage.addEventListener('pointercancel', up);
+
+  // memories
+  const modal=$('modal');
+  const show = (img, text, fin) => { document.querySelector('.card').classList.toggle('final', !!fin); $('mimg').src=img; $('mtext').textContent=text||''; modal.classList.add('open'); };
+  function openAt(cx,cy){
+    const x=Math.floor((cx-tx)/scale/CELL), y=Math.floor((cy-ty)/scale/CELL);
+    if (x<0||y<0||x>=cols||y>=rows) return;
+    const t=tiles[grid[y*cols+x]]; show(t.file, t.text);
+  }
+  modal.onclick = () => modal.classList.remove('open');
+  addEventListener('keydown', e => { if(e.key==='Escape') modal.classList.remove('open'); });
+  if (cfg.finalMessage) { const b=$('letter'); b.style.display='block';
+    b.onclick = () => show(cfg.finalImage || cfg.main, cfg.finalMessage, true); }
+
+  // reveal: pixel-art of her first, then each square turns into a memory
+  $('loading').style.opacity=0; setTimeout(()=>$('loading').remove(),900);
+  const order=[...Array(cols*rows).keys()].sort(()=>Math.random()-.5);
+  let i=0; const per=Math.ceil(order.length/150);
+  setTimeout(function step(){ for(let n=0;n<per&&i<order.length;n++) photo(order[i++]); if(i<order.length) requestAnimationFrame(step); }, 1200);
+  setTimeout(()=>$('hint').style.opacity=.7, 100);
+})();
+</script>
+</body>
+</html>
